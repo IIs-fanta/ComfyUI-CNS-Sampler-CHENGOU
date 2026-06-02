@@ -34,8 +34,22 @@ def _load_bundled_gamma():
         print(f"[CNS] gamma_matrix_scaled.pt not found in node directory. Using built-in approximation.")
     return None
 
-# Load once at import time
-_BUNDLED_GAMMA = _load_bundled_gamma()
+_BUNDLED_GAMMA = None
+_BUNDLED_GAMMA_LOADED = False
+
+
+def _get_bundled_gamma(use_bundled_gamma_matrix):
+    """Lazily load the bundled gamma matrix only when the node option is enabled."""
+    global _BUNDLED_GAMMA, _BUNDLED_GAMMA_LOADED
+
+    if not use_bundled_gamma_matrix:
+        return None
+
+    if not _BUNDLED_GAMMA_LOADED:
+        _BUNDLED_GAMMA = _load_bundled_gamma()
+        _BUNDLED_GAMMA_LOADED = True
+
+    return _BUNDLED_GAMMA
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,6 +347,10 @@ class CNSSamplerNode:
                     "default": 32, "min": 8, "max": 128, "step": 8,
                     "tooltip": "Number of radial frequency bands. 32 is a good default."
                 }),
+                "use_bundled_gamma_matrix": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Load gamma_matrix_scaled.pt from this node folder. Disable to use the built-in sigma-schedule approximation."
+                }),
             },
 
         }
@@ -344,10 +362,10 @@ class CNSSamplerNode:
 
     def get_sampler(self, s_churn, power_gamma, gamma_divider, energy_scale,
                     alpha_tilt_start, alpha_tilt_end, alpha_use_fnorm,
-                    alpha_exp_interp, alpha_exp_sharpness, num_freq_bins):
+                    alpha_exp_interp, alpha_exp_sharpness, num_freq_bins,
+                    use_bundled_gamma_matrix):
 
-        # Use the bundled gamma matrix (loaded at import time)
-        gamma_matrix = _BUNDLED_GAMMA
+        gamma_matrix = _get_bundled_gamma(use_bundled_gamma_matrix)
 
         sampler_fn = lambda model, x, sigmas, extra_args, callback, disable: \
             sample_euler_cns(

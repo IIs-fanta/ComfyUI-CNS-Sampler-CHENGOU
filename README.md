@@ -8,6 +8,7 @@ Based on the paper [Colored Noise Diffusion Sampling](https://arxiv.org/abs/2605
 
 - Fixed a sampler crash when ComfyUI passes latent tensors with extra leading dimensions, such as video or XPU backend shapes. CNS now treats the last two tensor dimensions as spatial `H/W` and supports both standard 4D latents and 5D+ latents. See [issue #3](https://github.com/IIs-fanta/ComfyUI-CNS-Sampler-CHENGOU/issues/3).
 - Restored terminal progress output for the custom CNS sampling loop using `tqdm`, while still respecting ComfyUI's `disable_pbar` flag. The terminal now shows step progress, elapsed time, and ETA. See [issue #1](https://github.com/IIs-fanta/ComfyUI-CNS-Sampler-CHENGOU/issues/1).
+- Added `use_bundled_gamma_matrix`, a node toggle for choosing whether to load `gamma_matrix_scaled.pt` from the node folder. Disable it to use the built-in sigma-schedule approximation instead.
 
 <details>
 <summary>📖 中文说明 / Chinese README</summary>
@@ -70,7 +71,7 @@ RandomNoise / DisableNoise ─────────────────�
 | `alpha_exp_interp` | True | 用指数插值替代线性插值 |
 | `alpha_exp_sharpness` | 0.75 | 指数插值曲线的锐度 |
 | `num_freq_bins` | 32 | 径向频率分箱数量 |
-| `gamma_matrix_pt` | （空） | 可选：官方预计算 gamma 矩阵路径（.pt 文件） |
+| `use_bundled_gamma_matrix` | True | 是否加载 node 文件夹中的 `gamma_matrix_scaled.pt`；关闭时使用内置 sigma schedule 近似 |
 
 ---
 
@@ -106,7 +107,7 @@ alpha_exp_interp = False
 
 本节点内置了一个基于 sigma schedule 的近似 gamma matrix，开箱即用无需额外文件。
 
-如果你有官方仓库里的 gamma_matrix_scaled.pt，放到 node 文件夹里，它会自动加载。如果不行，内置的基于西格玛的近似方法也没问题。
+如果 `use_bundled_gamma_matrix` 开启（默认），节点会从 node 文件夹加载 `gamma_matrix_scaled.pt`。关闭时不会加载该文件，而是使用内置的基于 sigma schedule 的近似方法。
 https://github.com/HadarDavidson/colored-noise-sampling
 
 下载 `gamma_matrix/gamma_matrix_scaled.pt` 
@@ -193,7 +194,7 @@ RandomNoise / DisableNoise ─────────────────�
 | `alpha_exp_interp` | True | Exponential (vs linear) interpolation between alpha values |
 | `alpha_exp_sharpness` | 0.75 | Sharpness of exponential alpha interpolation |
 | `num_freq_bins` | 32 | Number of radial frequency bins |
-| `gamma_matrix_pt` | *(empty)* | Optional: path to a precomputed `.pt` gamma matrix from the official repo |
+| `use_bundled_gamma_matrix` | True | Load `gamma_matrix_scaled.pt` from the node folder. Disable to use the built-in sigma-schedule approximation |
 
 ---
 
@@ -229,7 +230,7 @@ alpha_exp_interp = False
 
 The node ships with a built-in approximation of the gamma matrix derived from the sigma schedule — no extra files needed to get started.
 
-If you have gamma_matrix_scaled.pt from the official repo, put it in the node folder and it loads automatically. If not, there's a built-in sigma-based approximation that works fine.
+When `use_bundled_gamma_matrix` is enabled (default), the node loads `gamma_matrix_scaled.pt` from the node folder. Disable it to skip loading that file and use the built-in sigma-schedule approximation instead.
 
 https://github.com/HadarDavidson/colored-noise-sampling
 
