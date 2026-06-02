@@ -4,6 +4,11 @@ A ComfyUI custom node implementing **Colored Noise Sampling (CNS)** — a plug-a
 
 Based on the paper [Colored Noise Diffusion Sampling](https://arxiv.org/abs/2605.30332) (Davidson et al., 2026).
 
+## Latest Fixes
+
+- Fixed a sampler crash when ComfyUI passes latent tensors with extra leading dimensions, such as video or XPU backend shapes. CNS now treats the last two tensor dimensions as spatial `H/W` and supports both standard 4D latents and 5D+ latents. See [issue #3](https://github.com/IIs-fanta/ComfyUI-CNS-Sampler-CHENGOU/issues/3).
+- Restored terminal progress output for the custom CNS sampling loop using `tqdm`, while still respecting ComfyUI's `disable_pbar` flag. The terminal now shows step progress, elapsed time, and ETA. See [issue #1](https://github.com/IIs-fanta/ComfyUI-CNS-Sampler-CHENGOU/issues/1).
+
 <details>
 <summary>📖 中文说明 / Chinese README</summary>
 

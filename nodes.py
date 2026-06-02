@@ -16,6 +16,7 @@ import numpy as np
 import comfy.samplers
 import comfy.sample
 import latent_preview
+from tqdm.auto import trange
 
 # Path to the bundled gamma matrix sitting next to this file
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -128,15 +129,15 @@ def apply_cns_to_noise(noise, beta, freq_bins, energy_scale=1.0):
     Modulate noise in 2D FFT space according to the CNS β schedule.
 
     Args:
-        noise:      (B, C, H, W) noise tensor
+        noise:      (..., H, W) noise tensor
         beta:       (num_bins,) per-frequency-bin scaling factors
         freq_bins:  (H, W) integer tensor mapping each pixel to a freq bin
         energy_scale: global energy multiplier (fine-tuning knob)
 
     Returns:
-        (B, C, H, W) colored noise tensor with same total variance as input
+        (..., H, W) colored noise tensor with same total variance as input
     """
-    B, C, H, W = noise.shape
+    H, W = noise.shape[-2:]
     device = noise.device
     beta = beta.to(device)
     freq_bins = freq_bins.to(device)
@@ -146,8 +147,8 @@ def apply_cns_to_noise(noise, beta, freq_bins, energy_scale=1.0):
     scale_map = scale_map * energy_scale
 
     # FFT → scale per frequency → iFFT
-    noise_f = torch.fft.fft2(noise)                  # (B, C, H, W) complex
-    scale_map = scale_map.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    noise_f = torch.fft.fft2(noise)                  # (..., H, W) complex
+    scale_map = scale_map.reshape((1,) * (noise.ndim - 2) + (H, W))
     noise_f_colored = noise_f * scale_map
 
     colored = torch.fft.ifft2(noise_f_colored).real  # back to real space
@@ -176,7 +177,10 @@ def sample_euler_cns(model, x, sigmas, extra_args=None, callback=None,
     Euler SDE sampler with Colored Noise Sampling (CNS) injection.
     """
     extra_args = extra_args or {}
-    B, C, H, W = x.shape
+    if x.ndim < 4:
+        raise ValueError(f"CNS sampler expected a tensor with spatial dimensions, got shape {tuple(x.shape)}")
+    batch_size = x.shape[0]
+    H, W = x.shape[-2:]
     T = len(sigmas) - 1
 
     # Pre-compute freq bins for this latent size
@@ -209,13 +213,13 @@ def sample_euler_cns(model, x, sigmas, extra_args=None, callback=None,
 
     alpha_tilt_end = alpha_tilt_end if alpha_tilt_end is not None else alpha_tilt_start
 
-    for i in range(T):
+    for i in trange(T, disable=disable):
         # Current and next sigma
         sigma = sigmas[i]
         sigma_next = sigmas[i + 1]
 
         # Model denoising prediction
-        denoised = model(x, sigma * torch.ones(B, device=x.device), **extra_args)
+        denoised = model(x, sigma * torch.ones(batch_size, device=x.device), **extra_args)
 
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigma, 'sigma_hat': sigma,
