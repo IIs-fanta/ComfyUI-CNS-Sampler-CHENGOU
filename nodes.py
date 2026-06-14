@@ -1,45 +1,53 @@
 """
-ComfyUI Custom Node: Colored Noise Sampler (CNS)
-Based on "Colored Noise Diffusion Sampling" (Davidson et al., 2026)
-https://arxiv.org/abs/2605.30332
+ComfyUI custom node for Colored Noise Sampling (CNS).
 
-CNS replaces uniform white noise injection in SDE sampling with a
-dynamic, frequency-decoupled schedule that routes energy toward
-structurally unresolved frequency bands — exploiting the spectral
-bias of diffusion models to improve generation quality.
+The frequency shaping follows the public implementation from
+HadarDavidson/colored-noise-sampling, adapted to ComfyUI's sampler API.
 """
 
+import math
 import os
+
 import torch
 import torch.nn.functional as F
-import numpy as np
 import comfy.samplers
-import comfy.sample
-import latent_preview
 from tqdm.auto import trange
 
-# Path to the bundled gamma matrix sitting next to this file
+
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUNDLED_GAMMA_PATH = os.path.join(_NODE_DIR, "gamma_matrix_scaled.pt")
-
-def _load_bundled_gamma():
-    if os.path.exists(_BUNDLED_GAMMA_PATH):
-        try:
-            gm = torch.load(_BUNDLED_GAMMA_PATH, map_location="cpu", weights_only=True)
-            print(f"[CNS] Loaded bundled gamma matrix: {_BUNDLED_GAMMA_PATH}, shape={gm.shape}")
-            return gm
-        except Exception as e:
-            print(f"[CNS] Warning: could not load bundled gamma matrix ({e}). Using built-in approximation.")
-    else:
-        print(f"[CNS] gamma_matrix_scaled.pt not found in node directory. Using built-in approximation.")
-    return None
 
 _BUNDLED_GAMMA = None
 _BUNDLED_GAMMA_LOADED = False
 
 
+def _torch_load_cpu(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_bundled_gamma():
+    if not os.path.exists(_BUNDLED_GAMMA_PATH):
+        print("[CNS] gamma_matrix_scaled.pt not found. Using sigma-schedule approximation.")
+        return None
+
+    try:
+        gamma = _torch_load_cpu(_BUNDLED_GAMMA_PATH)
+    except Exception as exc:
+        print(f"[CNS] Could not load bundled gamma matrix: {exc}. Using approximation.")
+        return None
+
+    if not torch.is_tensor(gamma) or gamma.ndim != 2:
+        print("[CNS] Bundled gamma matrix has an unexpected format. Using approximation.")
+        return None
+
+    print(f"[CNS] Loaded gamma matrix: {_BUNDLED_GAMMA_PATH}, shape={tuple(gamma.shape)}")
+    return gamma
+
+
 def _get_bundled_gamma(use_bundled_gamma_matrix):
-    """Lazily load the bundled gamma matrix only when the node option is enabled."""
     global _BUNDLED_GAMMA, _BUNDLED_GAMMA_LOADED
 
     if not use_bundled_gamma_matrix:
@@ -52,307 +60,382 @@ def _get_bundled_gamma(use_bundled_gamma_matrix):
     return _BUNDLED_GAMMA
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gamma Matrix: encodes per-frequency-band progress γ(f, t) ∈ [0, 1]
-# ─────────────────────────────────────────────────────────────────────────────
-
 def compute_radial_freq_bins(height, width, num_bins=32):
-    """
-    Compute radial frequency bin indices for a latent of given spatial size.
-    Returns a (H, W) integer tensor mapping each (h, w) position to a freq bin.
-    """
     fy = torch.fft.fftfreq(height)
     fx = torch.fft.fftfreq(width)
-    fy2d, fx2d = torch.meshgrid(fy, fx, indexing='ij')
-    r = torch.sqrt(fy2d ** 2 + fx2d ** 2)           # radial frequency, [0, ~0.7]
-    r_max = r.max().item() + 1e-8
-    bins = (r / r_max * (num_bins - 1)).long()        # map to [0, num_bins-1]
-    return bins                                        # (H, W)
+    fy2d, fx2d = torch.meshgrid(fy, fx, indexing="ij")
+
+    radius = torch.sqrt(fx2d.square() + fy2d.square())
+    radius = radius / radius.max().clamp(min=1e-8)
+    return (radius * (num_bins - 1)).long().clamp(0, num_bins - 1)
 
 
-def build_gamma_matrix_from_sigmas(sigmas, height, width, num_bins=32):
-    """
-    Build an approximate γ(f, t) matrix from sigma schedule.
+def build_gamma_matrix_from_sigmas(sigmas, num_bins=32):
+    """Fallback gamma matrix in official layout: rows are steps, columns are bins."""
+    steps = len(sigmas) - 1
+    gamma = torch.zeros(steps, num_bins, dtype=torch.float32)
 
-    The progress of a frequency band f at step t is approximated as:
-        γ(f, t) = 1 - σ(t) / σ(0)   (same for all bands in this approximation)
+    sigma_max = sigmas[0].detach().float().cpu().item()
+    sigma_max = max(sigma_max, 1e-8)
 
-    For a true gamma matrix you'd run an ODE analysis on the actual model
-    (see the official repo). This approximation gives reasonable results
-    and requires no precomputation.
-    """
-    T = len(sigmas) - 1          # number of steps (sigmas has T+1 elements)
-    gamma = torch.zeros(num_bins, T)
-    sigma_max = sigmas[0].item()
-    for t in range(T):
-        progress = 1.0 - (sigmas[t].item() / (sigma_max + 1e-8))
-        progress = max(0.0, min(1.0, progress))
-        gamma[:, t] = progress
-    return gamma                  # (num_bins, T)
+    for step in range(steps):
+        sigma = sigmas[step].detach().float().cpu().item()
+        progress = 1.0 - sigma / sigma_max
+        gamma[step, :] = max(0.0, min(1.0, progress))
+
+    return gamma
 
 
 def load_gamma_matrix(path):
-    """Load a precomputed gamma matrix saved as a .pt file."""
-    return torch.load(path, map_location='cpu', weights_only=True)
+    return _torch_load_cpu(path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CNS Noise Schedule: β_f(t) per the paper's formula
-# ─────────────────────────────────────────────────────────────────────────────
+def _gamma_as_steps_by_bins(gamma_matrix, num_bins):
+    """Accept official [steps, bins] matrices and older [bins, steps] matrices."""
+    if not torch.is_tensor(gamma_matrix) or gamma_matrix.ndim != 2:
+        raise ValueError("gamma matrix must be a 2D torch.Tensor")
 
-def compute_beta_schedule(gamma_t, power_gamma=1.0, gamma_divider=1.0,
-                           alpha_tilt=0.0, use_fnorm=False, num_bins=32):
+    rows, cols = gamma_matrix.shape
+    if cols == num_bins:
+        gamma = gamma_matrix
+    elif rows == num_bins:
+        gamma = gamma_matrix.t()
+    elif rows > cols:
+        gamma = gamma_matrix
+    else:
+        gamma = gamma_matrix.t()
+
+    return gamma.float()
+
+
+def _resize_gamma_matrix(gamma_matrix, steps, num_bins):
+    """Resize a [steps, bins] matrix without swapping its axes."""
+    gamma = gamma_matrix
+
+    if gamma.shape[0] != steps:
+        gamma = F.interpolate(
+            gamma.t().unsqueeze(0),
+            size=steps,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(0).t()
+
+    if gamma.shape[1] != num_bins:
+        gamma = F.interpolate(
+            gamma.unsqueeze(1),
+            size=num_bins,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(1)
+
+    return gamma[:steps, :num_bins]
+
+
+def prepare_gamma_matrix(gamma_matrix, sigmas, num_bins):
+    steps = len(sigmas) - 1
+
+    if gamma_matrix is None:
+        gamma_matrix = build_gamma_matrix_from_sigmas(sigmas, num_bins=num_bins)
+
+    try:
+        gamma = _gamma_as_steps_by_bins(gamma_matrix, num_bins)
+    except ValueError as exc:
+        print(f"[CNS] {exc}. Using sigma-schedule approximation.")
+        gamma = build_gamma_matrix_from_sigmas(sigmas, num_bins=num_bins)
+
+    return _resize_gamma_matrix(gamma, steps, num_bins)
+
+
+def _interpolate_alpha(step, steps, start, end, use_exp, sharpness):
+    progress = step / max(steps - 1, 1)
+
+    if use_exp:
+        denom = math.exp(sharpness) - 1.0
+        if abs(denom) > 1e-8:
+            progress = (math.exp(sharpness * progress) - 1.0) / denom
+
+    return start + progress * (end - start)
+
+
+def compute_noise_scaling(
+    gamma_step,
+    power_gamma=1.0,
+    gamma_divider=1.0,
+    alpha_tilt=0.0,
+    use_fnorm=False,
+):
     """
-    Compute the per-frequency noise scaling β_f(t) for a single timestep.
+    Per-frequency CNS scaling for one step.
 
-    Formula (from paper):
-        β_f(t) = sqrt(1 - γ_f(t)) / sqrt( mean_f'[(1 - γ_f'(t))] )
-
-    Args:
-        gamma_t:       (num_bins,) tensor, γ values at current timestep
-        power_gamma:   exponent applied to residual (1-γ) before normalising
-        gamma_divider: divides γ before computing residuals (weakens effect)
-        alpha_tilt:    frequency tilt — positive boosts high-freq, negative boosts low-freq
-        use_fnorm:     weight tilt by normalised frequency position
-        num_bins:      number of radial frequency bins
+    This mirrors the official cns_sde residual-energy path. The final global
+    variance conservation happens after FFT filtering in apply_cns_to_noise().
     """
-    gamma_t = (gamma_t / gamma_divider).clamp(0.0, 1.0)
-    residual = (1.0 - gamma_t).clamp(min=1e-8) ** power_gamma   # (num_bins,)
+    gamma_divider = max(float(gamma_divider), 1e-8)
+    base_residual = 1.0 - gamma_step / gamma_divider
 
-    # Frequency tilt: shift energy toward high or low frequencies
     if alpha_tilt != 0.0:
-        freqs = torch.linspace(0.0, 1.0, num_bins, device=gamma_t.device)
         if use_fnorm:
-            tilt = torch.exp(alpha_tilt * freqs)
+            f_norm = torch.linspace(
+                0.0,
+                1.0,
+                steps=gamma_step.numel(),
+                device=gamma_step.device,
+                dtype=gamma_step.dtype,
+            )
+            residual_energy = torch.exp(alpha_tilt * f_norm) * base_residual
         else:
-            tilt = torch.ones(num_bins, device=gamma_t.device) * (1.0 + alpha_tilt)
-        residual = residual * tilt
+            residual_energy = torch.exp(alpha_tilt * base_residual)
+    else:
+        residual_energy = base_residual
 
-    # Normalise so total injected energy is preserved (mean β² = 1)
-    mean_residual = residual.mean().clamp(min=1e-8)
-    beta = torch.sqrt(residual / mean_residual)                  # (num_bins,)
-    return beta
+    residual_energy = residual_energy.clamp(min=0.0)
+    if power_gamma != 1.0:
+        residual_energy = residual_energy.pow(power_gamma)
+
+    return residual_energy
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Apply CNS scaling to a noise tensor in frequency space
-# ─────────────────────────────────────────────────────────────────────────────
+def compute_beta_schedule(
+    gamma_t,
+    power_gamma=1.0,
+    gamma_divider=1.0,
+    alpha_tilt=0.0,
+    use_fnorm=False,
+    num_bins=None,
+):
+    """Backward-compatible name kept for old imports/workflows."""
+    return compute_noise_scaling(
+        gamma_t,
+        power_gamma=power_gamma,
+        gamma_divider=gamma_divider,
+        alpha_tilt=alpha_tilt,
+        use_fnorm=use_fnorm,
+    )
 
-def apply_cns_to_noise(noise, beta, freq_bins, energy_scale=1.0):
-    """
-    Modulate noise in 2D FFT space according to the CNS β schedule.
 
-    Args:
-        noise:      (..., H, W) noise tensor
-        beta:       (num_bins,) per-frequency-bin scaling factors
-        freq_bins:  (H, W) integer tensor mapping each pixel to a freq bin
-        energy_scale: global energy multiplier (fine-tuning knob)
-
-    Returns:
-        (..., H, W) colored noise tensor with same total variance as input
-    """
-    H, W = noise.shape[-2:]
+def apply_cns_to_noise(noise, noise_scaling, freq_bins, energy_scale=1.0):
+    height, width = noise.shape[-2:]
+    dtype = noise.dtype
     device = noise.device
-    beta = beta.to(device)
-    freq_bins = freq_bins.to(device)
 
-    # Build a (H, W) scaling map from the per-bin β values
-    scale_map = beta[freq_bins]                      # (H, W)
-    scale_map = scale_map * energy_scale
+    scale_grid = noise_scaling.to(device=device, dtype=torch.float32)[freq_bins.to(device)]
+    scale_grid = scale_grid.reshape((1,) * (noise.ndim - 2) + (height, width))
 
-    # FFT → scale per frequency → iFFT
-    noise_f = torch.fft.fft2(noise)                  # (..., H, W) complex
-    scale_map = scale_map.reshape((1,) * (noise.ndim - 2) + (H, W))
-    noise_f_colored = noise_f * scale_map
+    noise_float = noise.to(torch.float32)
+    filtered = torch.fft.ifft2(torch.fft.fft2(noise_float) * scale_grid).real
 
-    colored = torch.fft.ifft2(noise_f_colored).real  # back to real space
+    filtered_std = filtered.std()
+    if filtered_std > 1e-9:
+        filtered = filtered / filtered_std
 
-    # Re-normalise to match the original noise std (variance-preserving)
-    orig_std   = noise.std(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    colored_std = colored.std(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    colored = colored * (orig_std / colored_std)
+    filtered = filtered * float(energy_scale)
+    return filtered.to(dtype=dtype)
 
-    return colored
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom sampler that wraps Euler SDE with CNS noise injection
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def sample_euler_cns(model, x, sigmas, extra_args=None, callback=None,
-                     disable=None, s_churn=0.5, gamma_matrix=None,
-                     power_gamma=1.0, gamma_divider=1.0,
-                     alpha_tilt_start=0.0, alpha_tilt_end=None,
-                     alpha_use_fnorm=False, alpha_exp_interp=False,
-                     alpha_exp_sharpness=0.75, energy_scale=1.0,
-                     num_bins=32):
-    """
-    Euler SDE sampler with Colored Noise Sampling (CNS) injection.
-    """
+def sample_euler_cns(
+    model,
+    x,
+    sigmas,
+    extra_args=None,
+    callback=None,
+    disable=None,
+    s_churn=0.5,
+    gamma_matrix=None,
+    power_gamma=1.0,
+    gamma_divider=1.0,
+    alpha_tilt_start=0.0,
+    alpha_tilt_end=None,
+    alpha_use_fnorm=False,
+    alpha_exp_interp=False,
+    alpha_exp_sharpness=0.75,
+    energy_scale=1.0,
+    num_bins=32,
+):
     extra_args = extra_args or {}
     if x.ndim < 4:
-        raise ValueError(f"CNS sampler expected a tensor with spatial dimensions, got shape {tuple(x.shape)}")
+        raise ValueError(f"CNS sampler expected a spatial latent tensor, got shape {tuple(x.shape)}")
+
     batch_size = x.shape[0]
-    H, W = x.shape[-2:]
-    T = len(sigmas) - 1
+    height, width = x.shape[-2:]
+    steps = len(sigmas) - 1
 
-    # Pre-compute freq bins for this latent size
-    freq_bins = compute_radial_freq_bins(H, W, num_bins=num_bins)
+    freq_bins = compute_radial_freq_bins(height, width, num_bins=num_bins)
+    gamma_matrix = prepare_gamma_matrix(gamma_matrix, sigmas, num_bins=num_bins)
+    alpha_tilt_end = alpha_tilt_start if alpha_tilt_end is None else alpha_tilt_end
 
-    # Build or use provided gamma matrix
-    if gamma_matrix is None:
-        gamma_matrix = build_gamma_matrix_from_sigmas(sigmas, H, W, num_bins=num_bins)
-    gamma_matrix = gamma_matrix.float()
+    for step in trange(steps, disable=disable):
+        sigma = sigmas[step]
+        sigma_next = sigmas[step + 1]
 
-    # Resize gamma matrix to (num_bins, T) using 1D linear interp on each axis.
-    # Always use (N, 1, L) → 1D linear → squeeze to avoid dimension mismatch errors.
-    if gamma_matrix.shape[1] != T:
-        # Resize time axis: treat bins as batch dim
-        gamma_matrix = F.interpolate(
-            gamma_matrix.unsqueeze(1),   # (bins, 1, T_orig)
-            size=T,
-            mode='linear',
-            align_corners=False
-        ).squeeze(1)                     # (bins, T)
-    if gamma_matrix.shape[0] != num_bins:
-        # Resize freq-bin axis: transpose so bins become the last dim, interp, transpose back
-        gamma_matrix = F.interpolate(
-            gamma_matrix.t().unsqueeze(1),   # (T, 1, orig_bins)
-            size=num_bins,
-            mode='linear',
-            align_corners=False
-        ).squeeze(1).t()                     # (num_bins, T)
-    gamma_matrix = gamma_matrix[:num_bins, :T]
-
-    alpha_tilt_end = alpha_tilt_end if alpha_tilt_end is not None else alpha_tilt_start
-
-    for i in trange(T, disable=disable):
-        # Current and next sigma
-        sigma = sigmas[i]
-        sigma_next = sigmas[i + 1]
-
-        # Model denoising prediction
-        denoised = model(x, sigma * torch.ones(batch_size, device=x.device), **extra_args)
+        sigma_in = sigma * torch.ones(batch_size, device=x.device)
+        denoised = model(x, sigma_in, **extra_args)
 
         if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigma, 'sigma_hat': sigma,
-                      'denoised': denoised})
-
-        # ODE step: Euler along the probability flow direction
-        # dx = (x - denoised) / sigma * (sigma_next - sigma)
-        d = (x - denoised) / sigma
-        dt = sigma_next - sigma
-        x = x + d * dt
-
-        # SDE stochastic term — inject noise then re-add to keep variance on track
-        # sigma_up: how much noise to inject so total variance matches sigma_next
-        # Formula: sigma_up = sqrt(sigma_next^2 - sigma_next^2 * sigma_next^2 / sigma^2)
-        #        = sigma_next * sqrt(1 - (sigma_next/sigma)^2)   [Karras et al.]
-        if i < T - 1 and sigma_next > 0 and s_churn > 0:
-            ratio = (sigma_next / sigma).clamp(max=1.0)
-            sigma_up = sigma_next * (1 - ratio ** 2).clamp(min=0).sqrt()
-            sigma_up = sigma_up * s_churn
-
-            # Generate base white noise
-            noise = torch.randn_like(x)
-
-            # ── CNS: compute per-frequency β for this timestep ──────────────
-            t_norm = i / max(T - 1, 1)                   # normalise t to [0,1]
-            if alpha_exp_interp:
-                w = (torch.tensor(t_norm) * alpha_exp_sharpness).exp()
-                w = (w - 1) / (torch.tensor(alpha_exp_sharpness).exp() - 1 + 1e-8)
-                w = w.item()
-            else:
-                w = t_norm
-
-            alpha_t = alpha_tilt_start + w * (alpha_tilt_end - alpha_tilt_start)
-
-            gamma_t = gamma_matrix[:, i]                  # (num_bins,)
-            beta = compute_beta_schedule(
-                gamma_t,
-                power_gamma=power_gamma,
-                gamma_divider=gamma_divider,
-                alpha_tilt=alpha_t,
-                use_fnorm=alpha_use_fnorm,
-                num_bins=num_bins,
+            callback(
+                {
+                    "x": x,
+                    "i": step,
+                    "sigma": sigma,
+                    "sigma_hat": sigma,
+                    "denoised": denoised,
+                }
             )
 
-            # Apply CNS frequency modulation
-            colored_noise = apply_cns_to_noise(noise, beta, freq_bins,
-                                               energy_scale=energy_scale)
-            # ────────────────────────────────────────────────────────────────
+        d = (x - denoised) / sigma
+        x = x + d * (sigma_next - sigma)
 
-            x = x + colored_noise * sigma_up
+        if step >= steps - 1 or sigma_next <= 0 or s_churn <= 0:
+            continue
+
+        ratio = (sigma_next / sigma).clamp(max=1.0)
+        sigma_up = sigma_next * (1.0 - ratio.square()).clamp(min=0.0).sqrt()
+        sigma_up = sigma_up * s_churn
+
+        alpha_t = _interpolate_alpha(
+            step,
+            steps,
+            alpha_tilt_start,
+            alpha_tilt_end,
+            alpha_exp_interp,
+            alpha_exp_sharpness,
+        )
+
+        gamma_step = gamma_matrix[step].to(device=x.device, dtype=torch.float32)
+        noise_scaling = compute_noise_scaling(
+            gamma_step,
+            power_gamma=power_gamma,
+            gamma_divider=gamma_divider,
+            alpha_tilt=alpha_t,
+            use_fnorm=alpha_use_fnorm,
+        )
+
+        noise = torch.randn_like(x)
+        colored_noise = apply_cns_to_noise(
+            noise,
+            noise_scaling,
+            freq_bins,
+            energy_scale=energy_scale,
+        )
+        x = x + colored_noise * sigma_up
 
     return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ComfyUI Node: CNSSamplerNode
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CNSSamplerNode:
     """
-    Colored Noise Sampler (CNS) for ComfyUI.
+    Colored Noise Sampler for ComfyUI.
 
-    Drop-in replacement for standard SDE samplers. Connects to
-    SamplerCustomAdvanced (or KSampler via the SAMPLER output).
-
-    Based on: "Colored Noise Diffusion Sampling" (Davidson et al., 2026)
-    https://arxiv.org/abs/2605.30332
+    The sampler is meant for SamplerCustomAdvanced and returns a standard
+    ComfyUI SAMPLER object.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "s_churn": ("FLOAT", {
-                    "default": 0.5, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "SDE noise strength. 0 = ODE (no stochasticity). 0.5 is a good default."
-                }),
-                "power_gamma": ("FLOAT", {
-                    "default": 0.75, "min": 0.1, "max": 3.0, "step": 0.05,
-                    "tooltip": "Exponent on residual (1-γ). Lower = gentler coloring. Paper uses 0.75 for unguided."
-                }),
-                "gamma_divider": ("FLOAT", {
-                    "default": 1.73, "min": 0.1, "max": 50.0, "step": 0.01,
-                    "tooltip": "Divides γ values, weakening the coloring effect. Paper: 1.73 unguided, 25.0 guided."
-                }),
-                "energy_scale": ("FLOAT", {
-                    "default": 0.98, "min": 0.5, "max": 1.5, "step": 0.005,
-                    "tooltip": "Global energy multiplier after normalisation. Paper uses 0.98 (unguided) / 0.998 (guided)."
-                }),
-                "alpha_tilt_start": ("FLOAT", {
-                    "default": 0.15, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Frequency tilt at the start of sampling. Positive = boost high-freq. Paper: 0.15 unguided."
-                }),
-                "alpha_tilt_end": ("FLOAT", {
-                    "default": -0.5, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Frequency tilt at the end of sampling. Paper: -0.5 unguided, 0.03 guided."
-                }),
-                "alpha_use_fnorm": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Weight tilt by normalised frequency position. Recommended when using two-value tilting."
-                }),
-                "alpha_exp_interp": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Use exponential (vs linear) interpolation between alpha_start and alpha_end."
-                }),
-                "alpha_exp_sharpness": ("FLOAT", {
-                    "default": 0.75, "min": 0.1, "max": 10.0, "step": 0.05,
-                    "tooltip": "Sharpness of exponential alpha interpolation. Paper uses 0.75."
-                }),
-                "num_freq_bins": ("INT", {
-                    "default": 32, "min": 8, "max": 128, "step": 8,
-                    "tooltip": "Number of radial frequency bands. 32 is a good default."
-                }),
-                "use_bundled_gamma_matrix": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Load gamma_matrix_scaled.pt from this node folder. Disable to use the built-in sigma-schedule approximation."
-                }),
+                "s_churn": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.01,
+                        "tooltip": "SDE noise strength. 0 disables the stochastic CNS term.",
+                    },
+                ),
+                "power_gamma": (
+                    "FLOAT",
+                    {
+                        "default": 0.75,
+                        "min": 0.1,
+                        "max": 3.0,
+                        "step": 0.05,
+                        "tooltip": "Power applied to the residual energy. Official unguided setting: 0.75.",
+                    },
+                ),
+                "gamma_divider": (
+                    "FLOAT",
+                    {
+                        "default": 1.73,
+                        "min": 0.1,
+                        "max": 50.0,
+                        "step": 0.01,
+                        "tooltip": "Divides gamma before residual energy is computed. Official unguided setting: 1.73.",
+                    },
+                ),
+                "energy_scale": (
+                    "FLOAT",
+                    {
+                        "default": 0.98,
+                        "min": 0.5,
+                        "max": 1.5,
+                        "step": 0.005,
+                        "tooltip": "Applied after FFT filtering and unit-std normalization. Official unguided setting: 0.98.",
+                    },
+                ),
+                "alpha_tilt_start": (
+                    "FLOAT",
+                    {
+                        "default": 0.15,
+                        "min": -2.0,
+                        "max": 2.0,
+                        "step": 0.01,
+                        "tooltip": "Frequency tilt at the first step. Positive values favor higher frequencies.",
+                    },
+                ),
+                "alpha_tilt_end": (
+                    "FLOAT",
+                    {
+                        "default": -0.5,
+                        "min": -2.0,
+                        "max": 2.0,
+                        "step": 0.01,
+                        "tooltip": "Frequency tilt at the final step.",
+                    },
+                ),
+                "alpha_use_fnorm": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Use normalized radial frequency for alpha tilting, matching the official published settings.",
+                    },
+                ),
+                "alpha_exp_interp": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Use exponential interpolation between alpha_tilt_start and alpha_tilt_end.",
+                    },
+                ),
+                "alpha_exp_sharpness": (
+                    "FLOAT",
+                    {
+                        "default": 0.75,
+                        "min": 0.1,
+                        "max": 10.0,
+                        "step": 0.05,
+                        "tooltip": "Sharpness for exponential alpha interpolation. Official unguided setting: 0.75.",
+                    },
+                ),
+                "num_freq_bins": (
+                    "INT",
+                    {
+                        "default": 32,
+                        "min": 8,
+                        "max": 128,
+                        "step": 8,
+                        "tooltip": "Number of radial frequency bins. Official matrices use 32.",
+                    },
+                ),
+                "use_bundled_gamma_matrix": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Load gamma_matrix_scaled.pt from this node folder. Disable to use the sigma-schedule fallback.",
+                    },
+                ),
             },
-
         }
 
     RETURN_TYPES = ("SAMPLER",)
@@ -360,16 +443,27 @@ class CNSSamplerNode:
     FUNCTION = "get_sampler"
     CATEGORY = "sampling/custom_sampling/samplers"
 
-    def get_sampler(self, s_churn, power_gamma, gamma_divider, energy_scale,
-                    alpha_tilt_start, alpha_tilt_end, alpha_use_fnorm,
-                    alpha_exp_interp, alpha_exp_sharpness, num_freq_bins,
-                    use_bundled_gamma_matrix):
-
+    def get_sampler(
+        self,
+        s_churn,
+        power_gamma,
+        gamma_divider,
+        energy_scale,
+        alpha_tilt_start,
+        alpha_tilt_end,
+        alpha_use_fnorm,
+        alpha_exp_interp,
+        alpha_exp_sharpness,
+        num_freq_bins,
+        use_bundled_gamma_matrix,
+    ):
         gamma_matrix = _get_bundled_gamma(use_bundled_gamma_matrix)
 
-        sampler_fn = lambda model, x, sigmas, extra_args, callback, disable: \
-            sample_euler_cns(
-                model, x, sigmas,
+        def sampler_fn(model, x, sigmas, extra_args, callback, disable):
+            return sample_euler_cns(
+                model,
+                x,
+                sigmas,
                 extra_args=extra_args,
                 callback=callback,
                 disable=disable,
@@ -386,13 +480,8 @@ class CNSSamplerNode:
                 num_bins=num_freq_bins,
             )
 
-        sampler = comfy.samplers.KSAMPLER(sampler_fn)
-        return (sampler,)
+        return (comfy.samplers.KSAMPLER(sampler_fn),)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Node Registration
-# ─────────────────────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
     "CNSSampler_CHENGOU": CNSSamplerNode,
