@@ -1,3 +1,4 @@
+
 # ComfyUI-CNS-Sampler-CHENGOU
 
 A ComfyUI custom node for **Colored Noise Sampling (CNS)**, based on
@@ -14,6 +15,7 @@ to ComfyUI's `SAMPLER` interface.
 - Updated alpha tilting to follow the official residual-energy behavior.
 - Kept compatibility with ComfyUI latent tensors that have extra leading dimensions; the last two dimensions are treated as spatial `H/W`.
 - Cleaned up README/code comments and kept the node API stable for existing workflows.
+<img width="7087" height="5197" alt="CNSTEST_Jc" src="https://github.com/user-attachments/assets/21ad0cac-3480-47af-bd23-a729b778b646" />
 
 ## Install
 
